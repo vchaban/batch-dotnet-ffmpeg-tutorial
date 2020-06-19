@@ -26,8 +26,14 @@ namespace BatchDotnetTutorialFfmpeg
         private const string BatchAccountUrl = "";
 
         // Storage account credentials
-        private const string StorageAccountName = "";
-        private const string StorageAccountKey = "";
+        private const string StorageInputAccountName = "";
+        private const string StorageInputAccountKey = "";
+        private const string StorageInputContainer = "";
+
+        private const string StorageOutputAccountName = "";
+        private const string StorageOutputAccountKey = "";
+        private const string StorageOutputContainer = "";
+
 
         // Pool and Job constants
         private const string PoolId = "WinFFmpegPool";
@@ -42,15 +48,19 @@ namespace BatchDotnetTutorialFfmpeg
         // To add package to the Batch account, see https://docs.microsoft.com/azure/batch/batch-application-packages.
 
         const string appPackageId = "ffmpeg";
-        const string appPackageVersion = "3.4";
+        const string appPackageVersion = "4.2.3";
 
         public static void Main(string[] args)
         {
             if (String.IsNullOrEmpty(BatchAccountName) ||
                 String.IsNullOrEmpty(BatchAccountKey) ||
                 String.IsNullOrEmpty(BatchAccountUrl) ||
-                String.IsNullOrEmpty(StorageAccountName) ||
-                String.IsNullOrEmpty(StorageAccountKey))
+                String.IsNullOrEmpty(StorageInputAccountName) ||
+                String.IsNullOrEmpty(StorageInputAccountKey) || 
+                String.IsNullOrEmpty(StorageInputContainer) ||
+                String.IsNullOrEmpty(StorageOutputAccountName) ||
+                String.IsNullOrEmpty(StorageOutputAccountKey) || 
+                String.IsNullOrEmpty(StorageOutputContainer))
             {
                 throw new InvalidOperationException("One or more account credential strings have not been populated. Please ensure that your Batch and Storage account credentials have been specified.");
             }
@@ -87,41 +97,59 @@ namespace BatchDotnetTutorialFfmpeg
             timer.Start();
 
             // Construct the Storage account connection string
-            string storageConnectionString = String.Format("DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1}",
-                                StorageAccountName, StorageAccountKey);
+            string storageInputConnectionString = String.Format("DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1}",
+                                StorageInputAccountName, StorageInputAccountKey);
+            CloudStorageAccount storageInputAccount = CloudStorageAccount.Parse(storageInputConnectionString);
+            CloudBlobClient inputBlobClient = storageInputAccount.CreateCloudBlobClient();
 
-            // Retrieve the storage account
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(storageConnectionString);
 
-            // Create the blob client, for use in obtaining references to blob storage containers
-            CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();
 
-             
-            // Use the blob client to create the containers in blob storage
-            const string inputContainerName = "input";
-            const string outputContainerName = "output";
+             string storageOutputConnectionString = String.Format("DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1}",
+                                StorageOutputAccountName, StorageOutputAccountKey);
+            CloudStorageAccount storageOuputAccount = CloudStorageAccount.Parse(storageOutputConnectionString);
+            CloudBlobClient outputBlobClient = storageOuputAccount.CreateCloudBlobClient();
 
-            await CreateContainerIfNotExistAsync(blobClient, inputContainerName);
-            await CreateContainerIfNotExistAsync(blobClient, outputContainerName);
+            await CreateContainerIfNotExistAsync(outputBlobClient, StorageOutputContainer);
 
-            // RESOURCE FILE SETUP
-            // Input files: Specify the location of the data files that the tasks process, and
-            // put them in a List collection. Make sure you have copied the data files to:
-            // \<solutiondir>\InputFiles.
 
-            string inputPath = Path.Combine(Environment.CurrentDirectory, "InputFiles");
+            List<ResourceFile> inputFiles = new List<ResourceFile>();
+            var inputContainer = inputBlobClient.GetContainerReference(StorageInputContainer);
 
-            List<string> inputFilePaths = new List<string>(Directory.GetFileSystemEntries(inputPath, "*.mp4",
-                                         SearchOption.TopDirectoryOnly));
-               
-            // Upload data files.
-            // Upload the data files using UploadResourceFilesToContainer(). This data will be
-            // processed by each of the tasks that are executed on the compute nodes within the pool.
-            List<ResourceFile> inputFiles = await UploadFilesToContainerAsync(blobClient, inputContainerName, inputFilePaths);
+            Microsoft.WindowsAzure.Storage.OperationContext context = new Microsoft.WindowsAzure.Storage.OperationContext();
+            BlobContinuationToken continuationToken = null;
+            do
+            {
+                var result = await inputContainer.ListBlobsSegmentedAsync(
+                    "",
+                    true,
+                    BlobListingDetails.None,
+                    100,
+                    continuationToken,
+                    null,
+                    context);
+
+                SharedAccessBlobPolicy sasConstraints = new SharedAccessBlobPolicy
+                {
+                    SharedAccessExpiryTime = DateTime.UtcNow.AddHours(3),
+                    Permissions = SharedAccessBlobPermissions.Read
+                };
+
+                foreach (var blob in result.Results)
+                {
+                    if (blob is CloudBlockBlob b)
+                    {
+                        var sas = b.GetSharedAccessSignature(sasConstraints);
+                        var blobSasUri = $"{b.Uri}{sas}";
+                        inputFiles.Add(new ResourceFile(blobSasUri, b.Name));
+                    }
+                }
+                continuationToken = result.ContinuationToken;
+            } while (continuationToken != null);
+
 
             // Obtain a shared access signature that provides write access to the output container to which
             // the tasks will upload their output.
-            string outputContainerSasUrl = GetContainerSasUrl(blobClient, outputContainerName, SharedAccessBlobPermissions.Write);
+            string outputContainerSasUrl = GetContainerSasUrl(outputBlobClient, StorageOutputContainer, SharedAccessBlobPermissions.Write);
 
 
             // CREATE BATCH CLIENT / CREATE POOL / CREATE JOB / ADD TASKS
@@ -148,10 +176,10 @@ namespace BatchDotnetTutorialFfmpeg
                 await MonitorTasks(batchClient, JobId, TimeSpan.FromMinutes(30));
 
                 // Delete input container in storage
-                Console.WriteLine("Deleting container [{0}]...", inputContainerName);
-                CloudBlobContainer container = blobClient.GetContainerReference(inputContainerName);
-                await container.DeleteIfExistsAsync();
-                   
+                //Console.WriteLine("Deleting container [{0}]...", inputContainerName);
+                //CloudBlobContainer container = blobClient.GetContainerReference(inputContainerName);
+                //await container.DeleteIfExistsAsync();
+
                 // Print out timing info
                 timer.Stop();
                 Console.WriteLine();
@@ -164,7 +192,7 @@ namespace BatchDotnetTutorialFfmpeg
                 string response = Console.ReadLine().ToLower();
                 if (response != "n" && response != "no")
                 {
-                   await batchClient.JobOperations.DeleteJobAsync(JobId);
+                    await batchClient.JobOperations.DeleteJobAsync(JobId);
                 }
 
                 Console.Write("Delete pool? [yes] no: ");
@@ -175,7 +203,7 @@ namespace BatchDotnetTutorialFfmpeg
                 }
             }
         }
-       
+
         // FUNCTION IMPLEMENTATIONS
 
         /// <summary>
@@ -194,57 +222,57 @@ namespace BatchDotnetTutorialFfmpeg
 
         // RESOURCE FILE SETUP - FUNCTION IMPLEMENTATIONS
 
-        /// <summary>
-        /// Uploads the specified resource files to a container.
-        /// </summary>
-        /// <param name="blobClient">A <see cref="CloudBlobClient"/>.</param>
-        /// <param name="containerName">Name of the blob storage container to which the files are uploaded.</param>
-        /// <param name="filePaths">A collection of paths of the files to be uploaded to the container.</param>
-        /// <returns>A collection of <see cref="ResourceFile"/> objects.</returns>
-        private static async Task<List<ResourceFile>> UploadFilesToContainerAsync(CloudBlobClient blobClient, string inputContainerName, List<string> filePaths)
-        {
-            List<ResourceFile> resourceFiles = new List<ResourceFile>();
+        // /// <summary>
+        // /// Uploads the specified resource files to a container.
+        // /// </summary>
+        // /// <param name="blobClient">A <see cref="CloudBlobClient"/>.</param>
+        // /// <param name="containerName">Name of the blob storage container to which the files are uploaded.</param>
+        // /// <param name="filePaths">A collection of paths of the files to be uploaded to the container.</param>
+        // /// <returns>A collection of <see cref="ResourceFile"/> objects.</returns>
+        // private static async Task<List<ResourceFile>> UploadFilesToContainerAsync(CloudBlobClient blobClient, string inputContainerName, List<string> filePaths)
+        // {
+        //     List<ResourceFile> resourceFiles = new List<ResourceFile>();
 
-            foreach (string filePath in filePaths)
-            {
-                resourceFiles.Add(await UploadResourceFileToContainerAsync(blobClient, inputContainerName, filePath));
-            }
+        //     foreach (string filePath in filePaths)
+        //     {
+        //         resourceFiles.Add(await UploadResourceFileToContainerAsync(blobClient, inputContainerName, filePath));
+        //     }
 
-            return resourceFiles;
-        }
+        //     return resourceFiles;
+        // }
 
-        /// <summary>
-        /// Uploads the specified file to the specified blob container.
-        /// </summary>
-        /// <param name="blobClient">A <see cref="CloudBlobClient"/>.</param>
-        /// <param name="containerName">The name of the blob storage container to which the file should be uploaded.</param>
-        /// <param name="filePath">The full path to the file to upload to Storage.</param>
-        /// <returns>A ResourceFile object representing the file in blob storage.</returns>
-        private static async Task<ResourceFile> UploadResourceFileToContainerAsync(CloudBlobClient blobClient, string containerName, string filePath)
-        {
-            Console.WriteLine("Uploading file {0} to container [{1}]...", filePath, containerName);
+        // /// <summary>
+        // /// Uploads the specified file to the specified blob container.
+        // /// </summary>
+        // /// <param name="blobClient">A <see cref="CloudBlobClient"/>.</param>
+        // /// <param name="containerName">The name of the blob storage container to which the file should be uploaded.</param>
+        // /// <param name="filePath">The full path to the file to upload to Storage.</param>
+        // /// <returns>A ResourceFile object representing the file in blob storage.</returns>
+        // private static async Task<ResourceFile> UploadResourceFileToContainerAsync(CloudBlobClient blobClient, string containerName, string filePath)
+        // {
+        //     Console.WriteLine("Uploading file {0} to container [{1}]...", filePath, containerName);
 
-            string blobName = Path.GetFileName(filePath);
-            var fileStream = System.IO.File.OpenRead(filePath);
+        //     string blobName = Path.GetFileName(filePath);
+        //     var fileStream = System.IO.File.OpenRead(filePath);
 
-            CloudBlobContainer container = blobClient.GetContainerReference(containerName);
-            CloudBlockBlob blobData = container.GetBlockBlobReference(blobName);
-            await blobData.UploadFromFileAsync(filePath);
+        //     CloudBlobContainer container = blobClient.GetContainerReference(containerName);
+        //     CloudBlockBlob blobData = container.GetBlockBlobReference(blobName);
+        //     await blobData.UploadFromFileAsync(filePath);
 
-            // Set the expiry time and permissions for the blob shared access signature. In this case, no start time is specified,
-            // so the shared access signature becomes valid immediately
-            SharedAccessBlobPolicy sasConstraints = new SharedAccessBlobPolicy
-            {
-                SharedAccessExpiryTime = DateTime.UtcNow.AddHours(2),
-                Permissions = SharedAccessBlobPermissions.Read
-            };
+        //     // Set the expiry time and permissions for the blob shared access signature. In this case, no start time is specified,
+        //     // so the shared access signature becomes valid immediately
+        //     SharedAccessBlobPolicy sasConstraints = new SharedAccessBlobPolicy
+        //     {
+        //         SharedAccessExpiryTime = DateTime.UtcNow.AddHours(2),
+        //         Permissions = SharedAccessBlobPermissions.Read
+        //     };
 
-            // Construct the SAS URL for blob
-            string sasBlobToken = blobData.GetSharedAccessSignature(sasConstraints);
-            string blobSasUri = String.Format("{0}{1}", blobData.Uri, sasBlobToken);
+        //     // Construct the SAS URL for blob
+        //     string sasBlobToken = blobData.GetSharedAccessSignature(sasConstraints);
+        //     string blobSasUri = String.Format("{0}{1}", blobData.Uri, sasBlobToken);
 
-            return new ResourceFile(blobSasUri, blobName);
-        }
+        //     return new ResourceFile(blobSasUri, blobName);
+        // }
 
         /// <summary>
         /// Returns a shared access signature (SAS) URL providing the specified
@@ -306,8 +334,8 @@ namespace BatchDotnetTutorialFfmpeg
                     poolId: poolId,
                     targetDedicatedComputeNodes: DedicatedNodeCount,
                     targetLowPriorityComputeNodes: LowPriorityNodeCount,
-                    virtualMachineSize: PoolVMSize,                                                
-                    virtualMachineConfiguration: virtualMachineConfiguration);  
+                    virtualMachineSize: PoolVMSize,
+                    virtualMachineConfiguration: virtualMachineConfiguration);
 
                 // Specify the application and version to install on the compute nodes
                 // This assumes that a Windows 64-bit zipfile of ffmpeg has been added to Batch account
@@ -347,16 +375,16 @@ namespace BatchDotnetTutorialFfmpeg
         /// <param name="poolId">ID of the CloudPool object in which to create the job.</param>
         private static async Task CreateJobAsync(BatchClient batchClient, string jobId, string poolId)
         {
-            
-                Console.WriteLine("Creating job [{0}]...", jobId);
 
-                CloudJob job = batchClient.JobOperations.CreateJob();
-                job.Id = jobId;
-                job.PoolInformation = new PoolInformation { PoolId = poolId };
+            Console.WriteLine("Creating job [{0}]...", jobId);
 
-                await job.CommitAsync();
+            CloudJob job = batchClient.JobOperations.CreateJob();
+            job.Id = jobId;
+            job.PoolInformation = new PoolInformation { PoolId = poolId };
+
+            await job.CommitAsync();
         }
-       
+
 
         /// <summary>
         /// 
@@ -388,8 +416,8 @@ namespace BatchDotnetTutorialFfmpeg
                 string inputMediaFile = inputFiles[i].FilePath;
                 string outputMediaFile = String.Format("{0}{1}",
                     System.IO.Path.GetFileNameWithoutExtension(inputMediaFile),
-                    ".mp3");
-                string taskCommandLine = String.Format("cmd /c {0}\\ffmpeg-3.4-win64-static\\bin\\ffmpeg.exe -i {1} {2}", appPath, inputMediaFile, outputMediaFile);
+                    ".mp4");
+                string taskCommandLine = String.Format("cmd /c {0}\\ffmpeg-4.2.3-win64-static\\bin\\ffmpeg.exe -i {1} -c copy {2}", appPath, inputMediaFile, outputMediaFile);
 
                 // Create a cloud task (with the task ID and command line) and add it to the task list
                 CloudTask task = new CloudTask(taskId, taskCommandLine);
@@ -465,7 +493,7 @@ namespace BatchDotnetTutorialFfmpeg
             detail.FilterClause = "executionInfo/result eq 'Failure'";
 
             List<CloudTask> failedTasks = await batchClient.JobOperations.ListTasks(jobId, detail).ToListAsync();
-          
+
             if (failedTasks.Any())
             {
                 allTasksSuccessful = false;
@@ -475,7 +503,7 @@ namespace BatchDotnetTutorialFfmpeg
             {
                 Console.WriteLine(successMessage);
             }
-        return allTasksSuccessful;
+            return allTasksSuccessful;
         }
     }
 }
