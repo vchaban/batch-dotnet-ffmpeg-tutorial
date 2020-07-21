@@ -8,7 +8,9 @@ namespace BatchDotnetTutorialFfmpeg
     using System.Diagnostics;
     using System.IO;
     using System.Linq;
+    using System.Net;
     using System.Threading.Tasks;
+    using System.Web;
     using Microsoft.Azure.Batch;
     using Microsoft.Azure.Batch.Auth;
     using Microsoft.Azure.Batch.Common;
@@ -36,19 +38,19 @@ namespace BatchDotnetTutorialFfmpeg
 
 
         // Pool and Job constants
-        private const string PoolId = "WinFFmpegPool";
+        private const string PoolId = "NixFFmpegPool";
         private const int DedicatedNodeCount = 0;
-        private const int LowPriorityNodeCount = 5;
-        private const string PoolVMSize = "STANDARD_A1_v2";
-        private const string JobId = "WinFFmpegJob";
+        private const int LowPriorityNodeCount = 1;
+        private const string PoolVMSize = "STANDARD_F8s_v2";
+        private const string JobId = "NixFFmpegJob";
 
         // Application package Id and version
         // This assumes the Windows ffmpeg app package is already added to the Batch account with this Id and version. 
         // First download ffmpeg zipfile from https://ffmpeg.zeranoe.com/builds/win64/static/ffmpeg-3.4-win64-static.zip.
         // To add package to the Batch account, see https://docs.microsoft.com/azure/batch/batch-application-packages.
 
-        const string appPackageId = "ffmpeg";
-        const string appPackageVersion = "4.2.3";
+        const string appPackageId = "ffmpeg_nix";
+        const string appPackageVersion = "4.3";
 
         public static void Main(string[] args)
         {
@@ -56,10 +58,10 @@ namespace BatchDotnetTutorialFfmpeg
                 String.IsNullOrEmpty(BatchAccountKey) ||
                 String.IsNullOrEmpty(BatchAccountUrl) ||
                 String.IsNullOrEmpty(StorageInputAccountName) ||
-                String.IsNullOrEmpty(StorageInputAccountKey) || 
+                String.IsNullOrEmpty(StorageInputAccountKey) ||
                 String.IsNullOrEmpty(StorageInputContainer) ||
                 String.IsNullOrEmpty(StorageOutputAccountName) ||
-                String.IsNullOrEmpty(StorageOutputAccountKey) || 
+                String.IsNullOrEmpty(StorageOutputAccountKey) ||
                 String.IsNullOrEmpty(StorageOutputContainer))
             {
                 throw new InvalidOperationException("One or more account credential strings have not been populated. Please ensure that your Batch and Storage account credentials have been specified.");
@@ -71,7 +73,7 @@ namespace BatchDotnetTutorialFfmpeg
                 // calls to async methods within the "Main" method of this console application.
                 MainAsync().Wait();
             }
-            catch (AggregateException)
+            catch (AggregateException ex)
             {
                 Console.WriteLine();
                 Console.WriteLine("One or more exceptions occurred.");
@@ -104,8 +106,8 @@ namespace BatchDotnetTutorialFfmpeg
 
 
 
-             string storageOutputConnectionString = String.Format("DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1}",
-                                StorageOutputAccountName, StorageOutputAccountKey);
+            string storageOutputConnectionString = String.Format("DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1}",
+                               StorageOutputAccountName, StorageOutputAccountKey);
             CloudStorageAccount storageOuputAccount = CloudStorageAccount.Parse(storageOutputConnectionString);
             CloudBlobClient outputBlobClient = storageOuputAccount.CreateCloudBlobClient();
 
@@ -123,7 +125,7 @@ namespace BatchDotnetTutorialFfmpeg
                     "",
                     true,
                     BlobListingDetails.None,
-                    100,
+                    1,
                     continuationToken,
                     null,
                     context);
@@ -139,11 +141,12 @@ namespace BatchDotnetTutorialFfmpeg
                     if (blob is CloudBlockBlob b)
                     {
                         var sas = b.GetSharedAccessSignature(sasConstraints);
-                        var blobSasUri = $"{b.Uri}{sas}";
+                        var blobSasUri = $"{Uri.EscapeUriString(b.Uri.ToString())}{sas}";
                         inputFiles.Add(new ResourceFile(blobSasUri, b.Name));
                     }
                 }
                 continuationToken = result.ContinuationToken;
+                break;
             } while (continuationToken != null);
 
 
@@ -317,15 +320,18 @@ namespace BatchDotnetTutorialFfmpeg
                 Console.WriteLine("Creating pool [{0}]...", poolId);
 
                 ImageReference imageReference = new ImageReference(
-                        publisher: "MicrosoftWindowsServer",
-                        offer: "WindowsServer",
-                        sku: "2012-R2-Datacenter-smalldisk",
+                        publisher: "canonical",
+                        offer: "UbuntuServer",
+                        sku: "18.04-LTS",
                         version: "latest");
 
                 VirtualMachineConfiguration virtualMachineConfiguration =
                 new VirtualMachineConfiguration(
                     imageReference: imageReference,
-                    nodeAgentSkuId: "batch.node.windows amd64");
+                    nodeAgentSkuId: "batch.node.ubuntu 18.04");
+
+                virtualMachineConfiguration.DataDisks = new List<DataDisk>();
+                virtualMachineConfiguration.DataDisks.Add(new DataDisk(1, 200, CachingType.ReadWrite, StorageAccountType.StandardLrs));
 
                 // Create an unbound pool. No pool is actually created in the Batch service until we call
                 // CloudPool.Commit(). This CloudPool instance is therefore considered "unbound," and we can
@@ -375,14 +381,32 @@ namespace BatchDotnetTutorialFfmpeg
         /// <param name="poolId">ID of the CloudPool object in which to create the job.</param>
         private static async Task CreateJobAsync(BatchClient batchClient, string jobId, string poolId)
         {
-
             Console.WriteLine("Creating job [{0}]...", jobId);
+            try
+            {
+                await batchClient.JobOperations.GetJobAsync(jobId);
+                return;
+            }
+            catch (BatchException ex)
+            {
+                if (ex.InnerException is Microsoft.Azure.Batch.Protocol.Models.BatchErrorException inner)
+                {
+                    if (inner.Response.StatusCode != HttpStatusCode.NotFound)
+                    {
+                        throw;
+                    }
+                }
+                else
+                {
+                    throw;
+                }
+            }
 
             CloudJob job = batchClient.JobOperations.CreateJob();
             job.Id = jobId;
             job.PoolInformation = new PoolInformation { PoolId = poolId };
-
             await job.CommitAsync();
+
         }
 
 
@@ -412,12 +436,21 @@ namespace BatchDotnetTutorialFfmpeg
                 // Define task command line to convert the video format from MP4 to MP3 using ffmpeg.
                 // Note that ffmpeg syntax specifies the format as the file extension of the input file
                 // and the output file respectively. In this case inputs are MP4.
-                string appPath = String.Format("%AZ_BATCH_APP_PACKAGE_{0}#{1}%", appPackageId, appPackageVersion);
+                string appPath = String.Format("${{AZ_BATCH_APP_PACKAGE_{0}_{1}}}", appPackageId, appPackageVersion.Replace('.', '_'));
                 string inputMediaFile = inputFiles[i].FilePath;
                 string outputMediaFile = String.Format("{0}{1}",
                     System.IO.Path.GetFileNameWithoutExtension(inputMediaFile),
                     ".mp4");
-                string taskCommandLine = String.Format("cmd /c {0}\\ffmpeg-4.2.3-win64-static\\bin\\ffmpeg.exe -i {1} -c copy {2}", appPath, inputMediaFile, outputMediaFile);
+                //string taskCommandLine = String.Format("cmd /c {0}\\ffmpeg-4.2.3-win64-static\\bin\\ffmpeg.exe -i {1} -c copy {2}", appPath, inputMediaFile, outputMediaFile);
+
+                string taskCommandLine = $"/bin/sh -c \"{appPath}/ffmpeg -i \\\"{inputMediaFile}\\\" " +
+                    " -xerror -vcodec libx264 -vsync 2 -async 1 -profile:v baseline -level 3.0 -preset slow -pix_fmt yuv420p -b:v 5000k -minrate 5000k -maxrate 5000k -r 23.976 -g 23.976 " +
+                    " -map 0:0 -filter_complex \\\"[0:a:6]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono[a1]; " +
+                    " [0:a:7]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono[a2]; " +
+                    " [a1][a2]amerge=inputs=2,pan=stereo|c0<c0|c1<c1[aout]\\\" -map \\\"[aout]\\\" " +
+                    " -strict experimental -c:a aac -b:a 320k -ar 48000 -s 1920x1080 -movflags +faststart " +
+                    $" -y \\\"{outputMediaFile}\\\" \"";
+
 
                 // Create a cloud task (with the task ID and command line) and add it to the task list
                 CloudTask task = new CloudTask(taskId, taskCommandLine);
